@@ -171,6 +171,9 @@ MENU_ACTIONS _menuAction = NOTHING;
 bool _specialMenuActivated = false;
 time_t _timeSnapshotForSpecialMenu = 0;
 
+int _tempCurrentHour = -1;
+int _tempCurrentMinute = -1;
+
 void loop() {
 
   // Handle test mode
@@ -218,13 +221,30 @@ void loop() {
         lcd.setCursor(0, 2);
         if(_timeSnapshotForSpecialMenu == 0) {
           _timeSnapshotForSpecialMenu = myRTC.get();
+          _tempCurrentHour = hour(_timeSnapshotForSpecialMenu);
+          _tempCurrentMinute = minute(_timeSnapshotForSpecialMenu);
         }
-        int currentHour = hour(_timeSnapshotForSpecialMenu);
-        int currentMinute = minute(_timeSnapshotForSpecialMenu);
-        lcdPrintDigits(currentHour);
+        
+        lcdPrintDigits(_tempCurrentHour);
         lcd.print(":");
-        lcdPrintDigits(currentMinute);
-        // TODO add time change logic
+        lcdPrintDigits(_tempCurrentMinute);
+
+        // Handle hours
+        if (rotaryState == CLOCKWISE) {
+          if(_tempCurrentHour < 23) {
+            _tempCurrentHour++;
+          } else {
+            _tempCurrentHour = 0;
+          }
+        }
+        if (rotaryState == COUNTER_CLOCKWISE) {
+          if(_tempCurrentHour >= 1) {
+            _tempCurrentHour--;
+          } else {
+            _tempCurrentHour = 23;
+          }
+        }
+
         break;
       case RESET_SCHEMA:
         _specialMenuActivated = true;
@@ -520,11 +540,11 @@ void doButton() {
         _specialMenuActivated = false;
         break;
       case SET_TIME:
-        _specialMenuActivated = true;
+        _specialMenuActivated = !_specialMenuActivated;
         lcd.clear(); // Clear LCD for upcoming menu
         break;
       case RESET_SCHEMA:
-        _specialMenuActivated = true;
+        _specialMenuActivated = !_specialMenuActivated;
         lcd.clear(); // Clear LCD for upcoming menu
         break;
     }
