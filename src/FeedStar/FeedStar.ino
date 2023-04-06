@@ -6,21 +6,27 @@
 #include <Encoder.h>
 #include <EEPROM.h>
 
-constexpr uint8_t RTC_INT_PIN {2};  // RTC provides an alarm signal on this pin
-const unsigned int DEMAGNETIZE_DELAY_MS = 2000;
 enum BIN_STATE
 { 
   SHUT = 0,
   OPEN = 1
 };
-BIN_STATE BINS[7] = {SHUT, SHUT, SHUT, SHUT, SHUT, SHUT, SHUT};
-unsigned int NEXT_BIN_TO_OPEN = 0; // Always start emptying bin one on startup (the one that's closest to the ground)
 
 enum MENU_ACTIONS
 { 
   NOTHING = 0,
-  SET_TIME = 1,
-  RESET_SCHEMA = 2
+  SET_TIME = NOTHING + 1,
+  RESET_SCHEMA = SET_TIME + 1
+};
+
+struct AlarmScheme {
+  int number; // Bin number, etc.
+
+  int hour;   // 0..24
+  int minute; // 0..59
+
+  bool isEditedHours;   // Indicator if the user is changing the hours
+  bool isEditedMinutes; // Indicator if the user is changing the minutes
 };
 
 // INTERRUPT Wiring
@@ -31,6 +37,13 @@ DS3232RTC myRTC;
 // A5 = blue (SDA)
 // A4 = yellow (SDL)
 LCD_I2C lcd(0x27, 20, 4);
+
+// Pin definitions
+constexpr uint8_t RTC_INT_PIN {2};  // RTC provides an alarm signal on this pin
+const unsigned int SOFT_RESET_PIN = A0;
+Timemark softResetButtonHold(2000);
+bool _softResetButtonState = false;
+const unsigned int DEMAGNETIZE_DELAY_MS = 2000;
 
 // ROTARY Wiring --------------------------------
 // D2 = yellow (KEY_Rotary)
@@ -53,15 +66,8 @@ bool rotarySwitch = false;
 // RELAY Wiring (8 channel, we only use 7) ------
 int _relayPins[7] = { 6, 7, 8, 9, 10, 11, 12 };
 
-struct AlarmScheme {
-  int number; // Bin number, etc.
-
-  int hour;   // 0..24
-  int minute; // 0..59
-
-  bool isEditedHours;   // Indicator if the user is changing the hours
-  bool isEditedMinutes; // Indicator if the user is changing the minutes
-};
+// Status of all bins
+BIN_STATE BINS[7] = {SHUT, SHUT, SHUT, SHUT, SHUT, SHUT, SHUT};
 
 // Default time: 20:00, 23:00, 02:00, 05:00, 8:00, 11:00, 14:00
 AlarmScheme _as1 = { 1, 20, 0, false, false }; // Most bottom drawer
@@ -75,33 +81,88 @@ const int ALARM_SCHEME_COUNT = 7;
 AlarmScheme *_alarmSchemes[ALARM_SCHEME_COUNT] = { &_as1, &_as2, &_as3, &_as4, &_as5, &_as6, &_as7 };
 bool _allowChangingTheHours = false;   // Controls the changing of hours
 bool _allowChangingTheMinutes = false; // Controls the changing of minutes
-int _currentAlarmIndex = 0; // When program boots, start with this bin / alarm
+int _currentBinIndex = 0; // When program boots, start with this bin / alarm
+bool _testMode = false;
+bool _menuIsActive = false;
+int _currentSchemeSelection = 0;
+bool _currentSchemeSubSelection = true; // True = Hour, False = Minute
+MENU_ACTIONS _menuAction = 0;
+bool _specialMenuActivated = false;
+time_t _timeSnapshotForSpecialMenu = 0;
+
+int _tempCurrentHour = -1;
+int _tempCurrentMinute = -1;
 
 void rotaryServiceRoutineWrapper() {
     rotary.serviceRoutine();
 }
-
 void setup() {
   Serial.begin(9600);
 
   // initialize the alarms to known values, clear the alarm flags, clear the alarm interrupt flags
   pinMode(RTC_INT_PIN, INPUT_PULLUP); // Set interrupt pin for RTC module (alarm signal)
+
+  // ROTARY BUTTON INIT
+  pinMode(_buttonPin, INPUT_PULLUP);
+  _buttonState = digitalRead(_buttonPin);
+  debounce.start();
+  attachInterrupt(digitalPinToInterrupt(rotaryAPin), rotaryServiceRoutineWrapper, rotary.mode);
+
+  // RELAY INIT
+  pinMode(_relayPins[0], OUTPUT);
+  pinMode(_relayPins[1], OUTPUT);
+  pinMode(_relayPins[2], OUTPUT);
+  pinMode(_relayPins[3], OUTPUT);
+  pinMode(_relayPins[4], OUTPUT);
+  pinMode(_relayPins[5], OUTPUT);
+  pinMode(_relayPins[6], OUTPUT);
+
+  // Send all LOW's to not turn on the magnets on boot (TODO)
+  digitalWrite(_relayPins[0], HIGH);
+  digitalWrite(_relayPins[1], HIGH);
+  digitalWrite(_relayPins[2], HIGH);
+  digitalWrite(_relayPins[3], HIGH);
+  digitalWrite(_relayPins[4], HIGH);
+  digitalWrite(_relayPins[5], HIGH);
+  digitalWrite(_relayPins[6], HIGH);
+
+  // Configure Soft Reset button on A0
+  pinMode(SOFT_RESET_PIN, INPUT_PULLUP);
+  _softResetButtonState = digitalRead(SOFT_RESET_PIN);
+
+  // LCD INIT
+  lcd.begin();
+  lcd.backlight();
+}
+
+void resetProgram() {
+
+  // Re-initialize globals & menu items
+  _allowChangingTheHours = false;
+  _allowChangingTheMinutes = false;
+  _currentBinIndex = 0;
+  _testMode = false;
+  _menuIsActive = false;
+  _currentSchemeSelection = 0;
+  _currentSchemeSubSelection = true;
+  _menuAction = 0;
+  _specialMenuActivated = false;
+  _timeSnapshotForSpecialMenu = 0;
+  _tempCurrentHour = -1;
+  _tempCurrentMinute = -1;
+  _softResetButtonState =false;
+
+  // Reset bin states
+  for(int i=0; i<sizeof(BINS) / sizeof(BIN_STATE); i++) {
+    BINS[i] = SHUT;
+  }
+
+  // Reset alarms
   myRTC.begin();
   myRTC.setAlarm(DS3232RTC::ALM2_MATCH_DATE, 0, 0, 0, 1);
   myRTC.alarm(DS3232RTC::ALARM_2);
   myRTC.alarmInterrupt(DS3232RTC::ALARM_2, false);
   myRTC.squareWave(DS3232RTC::SQWAVE_NONE);
-
-/* Set time: 
-  tmElements_t tm;
-  tm.Hour = 14;               // set the RTC time to 06:29:50
-  tm.Minute = 57;
-  tm.Second = 20;
-  tm.Day = 2;
-  tm.Month = 4;
-  tm.Year = 2023 - 1970;      // tmElements_t.Year is the offset from 1970
-  myRTC.write(tm);            // set the RTC from the tm structure
-*/
 
   // For testing, initiate alarms with quick testable schedule
   time_t t = myRTC.get();
@@ -133,48 +194,12 @@ void setup() {
   myRTC.squareWave(DS3232RTC::SQWAVE_NONE);
   // enable interrupt output for Alarm 2 only
   myRTC.alarmInterrupt(DS3232RTC::ALARM_2, true);
-
-  // ROTARY BUTTON INIT
-  pinMode(_buttonPin, INPUT_PULLUP);
-  _buttonState = digitalRead(_buttonPin);
-  debounce.start();
-  attachInterrupt(digitalPinToInterrupt(rotaryAPin), rotaryServiceRoutineWrapper, rotary.mode);
-
-  // RELAY INIT
-  pinMode(_relayPins[0], OUTPUT);
-  pinMode(_relayPins[1], OUTPUT);
-  pinMode(_relayPins[2], OUTPUT);
-  pinMode(_relayPins[3], OUTPUT);
-  pinMode(_relayPins[4], OUTPUT);
-  pinMode(_relayPins[5], OUTPUT);
-  pinMode(_relayPins[6], OUTPUT);
-
-  // Send all LOW's to not turn on the magnets on boot (TODO)
-  digitalWrite(_relayPins[0], HIGH);
-  digitalWrite(_relayPins[1], HIGH);
-  digitalWrite(_relayPins[2], HIGH);
-  digitalWrite(_relayPins[3], HIGH);
-  digitalWrite(_relayPins[4], HIGH);
-  digitalWrite(_relayPins[5], HIGH);
-  digitalWrite(_relayPins[6], HIGH);
-
-  // LCD INIT
-  lcd.begin();
-  lcd.backlight();
 }
 
-bool _testMode = false;
-bool _menuIsActive = false;
-int _currentSchemeSelection = 0;
-bool _currentSchemeSubSelection = true; // True = Hour, False = Minute
-MENU_ACTIONS _menuAction = NOTHING;
-bool _specialMenuActivated = false;
-time_t _timeSnapshotForSpecialMenu = 0;
-
-int _tempCurrentHour = -1;
-int _tempCurrentMinute = -1;
-
 void loop() {
+
+  // Take care of soft resets by user long pressing a button
+  handleSoftReset();
 
   // Handle test mode
   if(_testMode) {
@@ -253,6 +278,30 @@ void loop() {
   }
 }
 
+void handleSoftReset() {
+  if (debounce.expired()) {
+    bool currentResetState = digitalRead(SOFT_RESET_PIN);
+    if (currentResetState != _softResetButtonState) {
+      _softResetButtonState = currentResetState;
+      if(currentResetState == LOW) {
+        if(softResetButtonHold.expired()) {
+          executeSoftReset();
+        } else {
+          Serial << "User pressed soft reset button but not long enough.\n";
+        }
+        softResetButtonHold.stop();
+      } else {
+        softResetButtonHold.start();
+      }
+    }
+  }
+}
+
+void executeSoftReset() {
+  Serial << "Executing soft reset ...\n";
+  resetProgram();
+}
+
 void readRotaryEncoderStates() {
   //Save the state of the rotary encoder. can only be called once per loop.
   rotaryState = rotary.getState();
@@ -267,18 +316,26 @@ void readRotaryEncoderStates() {
   //Returns true if turning Counter-Clockwise. COUNTER_CLOCKWISE = 1.
   if (rotaryState == COUNTER_CLOCKWISE) {
     if(!_menuIsActive && !_specialMenuActivated) {
-      _menuAction = SET_TIME;
-      lcd.setCursor(0, 4);
-      lcd.print(F("SET TIME     "));
+      int a = _menuAction;
+      a--;
+      if(a <= 0) {
+        a = 0;
+      }
+      _menuAction = a;
+      Serial << "cntr: " << a << "\n";
     }
   }
 
   //Returns true if turning Clockwise. CLOCKWISE = 2.
   if (rotaryState == CLOCKWISE) {
     if(!_menuIsActive && !_specialMenuActivated) {
-      _menuAction = RESET_SCHEMA;
-      lcd.setCursor(0, 4);
-      lcd.print(F("RESET SCHEMA"));
+      int a = _menuAction;
+      a++;
+      if(a >= 2) {
+        a = 2;
+      }
+      _menuAction = a;
+      Serial << "clk: " << a << "\n";
     }
   }
 }
@@ -303,33 +360,30 @@ void handleButtonKeyPresses() {
 }
 
 void handleAlarmOccurrence() {
-  if ( !digitalRead(RTC_INT_PIN) && (_currentAlarmIndex < ALARM_SCHEME_COUNT) ) {
+  if ( !digitalRead(RTC_INT_PIN) && (_currentBinIndex < ALARM_SCHEME_COUNT) ) {
     myRTC.alarm(DS3232RTC::ALARM_2);    // reset the alarm flag
     Serial << "Alarm #2 has occurred!\n";
-    _currentAlarmIndex++;
-    if(NEXT_BIN_TO_OPEN < (sizeof(BINS) / sizeof(BIN_STATE))) {
+    _currentBinIndex++;
+    if(_currentBinIndex < (sizeof(BINS) / sizeof(BIN_STATE))) {
       // Open first bin (from bottom to top)
-      openBin(NEXT_BIN_TO_OPEN);
-      NEXT_BIN_TO_OPEN++;
+      openBin(_currentBinIndex);
+      _currentBinIndex++;
 
-      if(NEXT_BIN_TO_OPEN == (sizeof(BINS) / sizeof(BIN_STATE))) {
+      if(_currentBinIndex == (sizeof(BINS) / sizeof(BIN_STATE))) {
         // When everything is empty, start again from the top (user has to make sure bins are manually closed & filled)
         BINS[7] = SHUT, SHUT, SHUT, SHUT, SHUT, SHUT, SHUT;
-
-        // TODO: Unify bin to open and current index
-        NEXT_BIN_TO_OPEN = 0;
-        _currentAlarmIndex = 0;
+        _currentBinIndex = 0;
       }
 
       // Schedule alarm for next bin
       Serial.println(F("Setting new alarm ..."));
       Serial.print(F("Next bin (index) to open = "));
-      Serial.print(NEXT_BIN_TO_OPEN);
+      Serial.print(_currentBinIndex);
       Serial.println();
       Serial.println(F("New alarm settings:"));
-      int h = _alarmSchemes[_currentAlarmIndex]->hour;
-      int m = _alarmSchemes[_currentAlarmIndex]->minute;
-      Serial << "Setting alarm #2 bin (ID: " << _currentAlarmIndex << ") on " << h << "h : " << m << "m\n";
+      int h = _alarmSchemes[_currentBinIndex]->hour;
+      int m = _alarmSchemes[_currentBinIndex]->minute;
+      Serial << "Setting alarm #2 bin (ID: " << _currentBinIndex << ") on " << h << "h : " << m << "m\n";
       myRTC.setAlarm(DS3232RTC::ALM2_MATCH_HOURS, 0, m, h, 0);
     }
   }
@@ -362,11 +416,25 @@ void drawStatusScreen(time_t t) {
 
   lcd.setCursor(0, 2);
   lcd.print(F("Voerbeurt > #"));
-  lcd.print(_currentAlarmIndex+1);
+  lcd.print(_currentBinIndex+1);
   lcd.print(" ");
-  lcdPrintDigits(_alarmSchemes[_currentAlarmIndex]->hour);
+  lcdPrintDigits(_alarmSchemes[_currentBinIndex]->hour);
   lcd.print(F(":"));
-  lcdPrintDigits(_alarmSchemes[_currentAlarmIndex]->minute);
+  lcdPrintDigits(_alarmSchemes[_currentBinIndex]->minute);
+
+  // Print special menu
+  lcd.setCursor(0, 4);
+  switch(_menuAction) {
+    case NOTHING:
+      lcd.print(F("             "));
+    break;
+    case SET_TIME:
+      lcd.print(F("SET TIME     "));
+    break;
+    case RESET_SCHEMA:
+      lcd.print(F("RESET SCHEMA "));
+    break;
+  }
 }
 
 bool isKnobRotatingClockwise() {
@@ -533,19 +601,18 @@ void lcdPrintDigits(int digits) {
 }
 
 void doButton() {
-
   if(!_menuIsActive) {
     switch(_menuAction) {
       case NOTHING:
         _specialMenuActivated = false;
         break;
       case SET_TIME:
-        _specialMenuActivated = !_specialMenuActivated;
-        lcd.clear(); // Clear LCD for upcoming menu
+        //_specialMenuActivated = !_specialMenuActivated;
+        //lcd.clear(); // Clear LCD for upcoming menu
         break;
       case RESET_SCHEMA:
-        _specialMenuActivated = !_specialMenuActivated;
-        lcd.clear(); // Clear LCD for upcoming menu
+        //_specialMenuActivated = !_specialMenuActivated;
+        //lcd.clear(); // Clear LCD for upcoming menu
         break;
     }
   }
@@ -587,17 +654,10 @@ void resetAlarm() {
   Serial << "Resetting alarms ...\n";
   myRTC.clearAlarm(DS3232RTC::ALARM_2);
   // set Alarm 2
-  int alarmHour = _alarmSchemes[_currentAlarmIndex]->hour;
-  int alarmMinute = _alarmSchemes[_currentAlarmIndex]->minute;
-  Serial << "Setting alarm #2 for bin " << _currentAlarmIndex+1 << " (ID: " << _currentAlarmIndex << ") on " << alarmHour << "h : " << alarmMinute << "m\n";
+  int alarmHour = _alarmSchemes[_currentBinIndex]->hour;
+  int alarmMinute = _alarmSchemes[_currentBinIndex]->minute;
+  Serial << "Setting alarm #2 for bin " << _currentBinIndex+1 << " (ID: " << _currentBinIndex << ") on " << alarmHour << "h : " << alarmMinute << "m\n";
   myRTC.setAlarm(DS3232RTC::ALM2_MATCH_HOURS, 0, alarmMinute, alarmHour, 0);
-}
-
-void saveAlarmSchemes() {
-  Serial << "Storing new alarm schemes...\n";
-  //Eeprom_Write_Obj(0, _alarmSchemes, sizeof(_alarmSchemes));
-
-    
 }
 
 bool hoursAreHighlighted() {
