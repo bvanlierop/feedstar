@@ -54,13 +54,13 @@ using Button = AblePullupDoubleClickerButton;
 Button smallButton(14); // The button to check.
 const unsigned int NUMBER_OF_BINS = 7;
 
+const unsigned long TIMEOUT_LCD_BACKLIGHT = 120000;
+
 // RELAY Wiring (8 channel, we only use 7)
 int _relayPins[NUMBER_OF_BINS] = { 6, 7, 8, 9, 10, 11, 12 };
 
 // Status of all bins
 BIN_STATE BINS[NUMBER_OF_BINS] = {SHUT, SHUT, SHUT, SHUT, SHUT, SHUT, SHUT};
-
-const int _timeoutBacklightMs = 120000;
 
 // Default time: 20:00, 23:00, 02:00, 05:00, 8:00, 11:00, 14:00
 AlarmScheme _as1 = { 1, 20, 0, false, false }; // Most bottom drawer
@@ -80,7 +80,7 @@ int _currentSchemeSelection = 0;
 bool _currentSchemeSubSelection = true; // True = Hour, False = Minute
 bool _systemClockSetupMenu = false;
 time_t _timeSnapshotForSpecialMenu = 0;
-long _previousMillis = 0; 
+unsigned long _previousMillis = 0; 
 int _tempCurrentHour = 0;
 int _tempCurrentMinute = 0;
 bool _changingSystemClockHours = true;
@@ -340,7 +340,7 @@ void loop() {
 
 void handleLcdBacklightStandbyMode() {
   unsigned long currentMillis = millis();
-  if(currentMillis - _previousMillis > _timeoutBacklightMs) {
+  if(currentMillis - _previousMillis > TIMEOUT_LCD_BACKLIGHT) {
     _previousMillis = currentMillis;
 
     // Turn off lcd
@@ -454,7 +454,7 @@ void drawStatusScreen(time_t t) {
   lcdPrintDigits(minute(t));
   lcd.print(F(":"));
   lcdPrintDigits(second(t));
-  lcd.print(F("    "));
+  lcd.print(F("     "));
   float celsius = myRTC.temperature() / 4.0;
   lcd.print((int)celsius);
   lcd.print((char)223);
