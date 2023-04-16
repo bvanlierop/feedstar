@@ -1,10 +1,11 @@
 #include <LCD_I2C.h>
-#include <DS3232RTC.h>      // https://github.com/JChristensen/DS3232RTC
-#include <Streaming.h>      // https://github.com/janelia-arduino/Streaming
+#include <DS3232RTC.h>
+#include <Streaming.h>
 #include <Timemark.h>
 #include <NRotary.h>
 #include <Encoder.h>
 #include <EEPROM.h>
+#include <AbleButtons.h>
 
 enum BIN_STATE
 { 
@@ -12,30 +13,17 @@ enum BIN_STATE
   OPEN = 1
 };
 
-enum MENU_ACTIONS
-{ 
-  NOTHING = 0,
-  SET_TIME = NOTHING + 1,
-  RESET_SCHEMA = SET_TIME + 1
-};
-
 struct AlarmScheme {
   int number; // Bin number, etc.
 
-  int hour;   // 0..24
+  int hour;   // 0..23
   int minute; // 0..59
 
   bool isEditedHours;   // Indicator if the user is changing the hours
   bool isEditedMinutes; // Indicator if the user is changing the minutes
 };
 
-// INTERRUPT Wiring
-// PIN D3 = brown (INT_RTC)
 DS3232RTC myRTC;
-
-// I2C Wiring
-// A5 = blue (SDA)
-// A4 = yellow (SDL)
 LCD_I2C lcd(0x27, 20, 4);
 
 // Pin definitions
@@ -45,12 +33,11 @@ Timemark softResetButtonHold(2000);
 bool _softResetButtonState = false;
 const unsigned int DEMAGNETIZE_DELAY_MS = 2000;
 
-// ROTARY Wiring --------------------------------
-// D2 = yellow (KEY_Rotary)
+// ROTARY Wiring
 const int _buttonPin = 5;
 bool _buttonState;
-const int DEBOUNCE_TIME_BUTTONS_MS = 40;
-const int LONG_PRESS_BUTTON_TIME_MS = 500;
+const int DEBOUNCE_TIME_BUTTONS_MS = 50;
+const int LONG_PRESS_BUTTON_TIME_MS = 750;
 Timemark debounce(DEBOUNCE_TIME_BUTTONS_MS);
 Timemark buttonHold(LONG_PRESS_BUTTON_TIME_MS);
 //Rotary encoder pin A.
@@ -61,15 +48,19 @@ bool usingInterrupt = true;
 Rotary rotary = Rotary(rotaryAPin, rotaryBPin, 12, usingInterrupt, INPUT_PULLUP, 50);
 int rotaryState = IDLE;
 bool rotarySwitch = false;
-// ----------------------------------------------
 
+// For double-click button
+using Button = AblePullupDoubleClickerButton;
+Button smallButton(14); // The button to check.
 const unsigned int NUMBER_OF_BINS = 7;
 
-// RELAY Wiring (8 channel, we only use 7) ------
+// RELAY Wiring (8 channel, we only use 7)
 int _relayPins[NUMBER_OF_BINS] = { 6, 7, 8, 9, 10, 11, 12 };
 
 // Status of all bins
 BIN_STATE BINS[NUMBER_OF_BINS] = {SHUT, SHUT, SHUT, SHUT, SHUT, SHUT, SHUT};
+
+const int _timeoutBacklightMs = 120000;
 
 // Default time: 20:00, 23:00, 02:00, 05:00, 8:00, 11:00, 14:00
 AlarmScheme _as1 = { 1, 20, 0, false, false }; // Most bottom drawer
@@ -84,16 +75,17 @@ AlarmScheme *_alarmSchemes[NUMBER_OF_BINS] = { &_as1, &_as2, &_as3, &_as4, &_as5
 bool _allowChangingTheHours = false;   // Controls the changing of hours
 bool _allowChangingTheMinutes = false; // Controls the changing of minutes
 int _currentBinIndex = 0; // When program boots, start with this bin / alarm
-bool _testMode = false;
 bool _menuIsActive = false;
 int _currentSchemeSelection = 0;
 bool _currentSchemeSubSelection = true; // True = Hour, False = Minute
-MENU_ACTIONS _menuAction = 0;
-bool _specialMenuActivated = false;
+bool _systemClockSetupMenu = false;
 time_t _timeSnapshotForSpecialMenu = 0;
-
-int _tempCurrentHour = -1;
-int _tempCurrentMinute = -1;
+long _previousMillis = 0; 
+int _tempCurrentHour = 0;
+int _tempCurrentMinute = 0;
+bool _changingSystemClockHours = true;
+int _numberOfTimesKnobButtonShortPressed = 0;
+long _previousMillisButtonShortPress = 0;
 
 void rotaryServiceRoutineWrapper() {
     rotary.serviceRoutine();
@@ -101,6 +93,7 @@ void rotaryServiceRoutineWrapper() {
 
 void setup() {
   Serial.begin(9600);
+  Serial << F("Starting FeedStar 600 program ...\n");
 
   // initialize the alarms to known values, clear the alarm flags, clear the alarm interrupt flags
   pinMode(RTC_INT_PIN, INPUT_PULLUP); // Set interrupt pin for RTC module (alarm signal)
@@ -144,6 +137,9 @@ void setup() {
   myRTC.alarmInterrupt(DS3232RTC::ALARM_2, false);
   myRTC.squareWave(DS3232RTC::SQWAVE_NONE);
 
+  // Init double clickable button (soft reset button)
+  smallButton.begin();
+
   // Configure the schema
   configureInitialSchema();
 
@@ -157,35 +153,35 @@ void resetProgram() {
   _allowChangingTheHours = false;
   _allowChangingTheMinutes = false;
   _currentBinIndex = 0;
-  _testMode = false;
   _menuIsActive = false;
   _currentSchemeSelection = 0;
   _currentSchemeSubSelection = true;
-  _menuAction = 0;
-  _specialMenuActivated = false;
-  _timeSnapshotForSpecialMenu = 0;
-  _tempCurrentHour = -1;
-  _tempCurrentMinute = -1;
-  _softResetButtonState =false;
+  _tempCurrentHour = 0;
+  _tempCurrentMinute = 0;
+  _softResetButtonState = false;
+  _systemClockSetupMenu = false;
+  _changingSystemClockHours = true;
+  _numberOfTimesKnobButtonShortPressed = 0;
+  _previousMillisButtonShortPress = 0;
 
   // Reset bin states
   for(int i=0; i<sizeof(BINS) / sizeof(BIN_STATE); i++) {
     BINS[i] = SHUT;
   }
  
-/* Set time: 
+  // Init time module
+  myRTC.begin();
+  
+  /* Set time: 
   tmElements_t tm;
-  tm.Hour = 14;               // set the RTC time to 06:29:50
-  tm.Minute = 37;
+  tm.Hour = 8;               // set the RTC time to 06:29:50
+  tm.Minute = 58;
   tm.Second = 0;
-  tm.Day = 6;
+  tm.Day = 10;
   tm.Month = 4;
   tm.Year = 2023 - 1970;      // tmElements_t.Year is the offset from 1970
   myRTC.write(tm);            // set the RTC from the tm structure
-*/
-
-  // Init time module
-  myRTC.begin();
+  */
   myRTC.setAlarm(DS3232RTC::ALM2_MATCH_DATE, 0, 0, 0, 1);
   myRTC.alarm(DS3232RTC::ALARM_2);
   myRTC.alarmInterrupt(DS3232RTC::ALARM_2, false);
@@ -201,7 +197,7 @@ void resetProgram() {
 void configureAlarm() {
   int alarmHour = _alarmSchemes[0]->hour;
   int alarmMinute = _alarmSchemes[0]->minute;
-  Serial << "Setting alarm #2 for first bin (ID: 0) on " << alarmHour << "h : " << alarmMinute << "m\n";
+  Serial << F("Setting alarm #2 for first bin (ID: 0) on ") << alarmHour << F("h : ") << alarmMinute << F("m\n");
   myRTC.setAlarm(DS3232RTC::ALM2_MATCH_HOURS, 0, alarmMinute, alarmHour, 0);
   // clear the alarm flags
   myRTC.alarm(DS3232RTC::ALARM_2);
@@ -231,15 +227,27 @@ void configureInitialSchema() {
 }
 
 void loop() {
+  smallButton.handle(); // Always handle() each button in a loop to use it.
+
+  if(smallButton.resetDoubleClicked() && !_menuIsActive) { // when the button was double-clicked.
+    if(_systemClockSetupMenu) {
+      tmElements_t tm;
+      tm.Hour = _tempCurrentHour;
+      tm.Minute = _tempCurrentMinute;
+      tm.Second = 0;
+      myRTC.write(tm);
+      Serial << F("Changed system time to to ") << _tempCurrentHour << F(":") << _tempCurrentMinute << F("\n");
+    }
+    _systemClockSetupMenu = !_systemClockSetupMenu;
+    Serial << F("Showing system clock setup menu: ") << _systemClockSetupMenu << F("\n");
+    lcd.clear();
+  }
+
+  // Dim backlight when there is no activity
+  handleLcdBacklightStandbyMode();
 
   // Take care of soft resets by user long pressing a button
   handleSoftReset();
-
-  // Handle test mode
-  if(_testMode) {
-    runTestMode();
-    return;
-  }
 
   // Read knob status
   readRotaryEncoderStates();
@@ -255,58 +263,89 @@ void loop() {
   time_t t = myRTC.get();
   if (t != tLast) {
     tLast = t;
-    if(!_menuIsActive && !_specialMenuActivated) {
+    if(!_menuIsActive && !_systemClockSetupMenu) {
       drawStatusScreen(t);
     }
   }
 
   // Handle settings menu
   // Display menu (when button is pressed long enough)
-  if(_menuIsActive && _menuAction == NOTHING) {
+  if(_menuIsActive && !_systemClockSetupMenu) {
     showSettingsMenu();
   }
 
   // Show menu for changing the time
-  if(_specialMenuActivated) {
-    switch(_menuAction) {
-      case NOTHING:
-        _specialMenuActivated = false;
-        break;
-      case SET_TIME:
-        lcd.setCursor(0, 0);
-        lcd.print(F("Sys. tijd instellen:"));
-        lcd.setCursor(0, 2);
-        if(_timeSnapshotForSpecialMenu == 0) {
-          _timeSnapshotForSpecialMenu = myRTC.get();
-          _tempCurrentHour = hour(_timeSnapshotForSpecialMenu);
-          _tempCurrentMinute = minute(_timeSnapshotForSpecialMenu);
-        }
-        
-        lcdPrintDigits(_tempCurrentHour);
-        lcd.print(":");
-        lcdPrintDigits(_tempCurrentMinute);
-
-        // Handle hours
-        if (rotaryState == CLOCKWISE) {
-          if(_tempCurrentHour < 23) {
-            _tempCurrentHour++;
-          } else {
-            _tempCurrentHour = 0;
-          }
-        }
-        if (rotaryState == COUNTER_CLOCKWISE) {
-          if(_tempCurrentHour >= 1) {
-            _tempCurrentHour--;
-          } else {
-            _tempCurrentHour = 23;
-          }
-        }
-
-        break;
-      case RESET_SCHEMA:
-        _specialMenuActivated = true;
-        break;
+  if(_systemClockSetupMenu) {
+    lcd.setCursor(0, 0);
+    lcd.print(F("Sys. tijd instellen:"));
+    lcd.setCursor(0, 2);
+    if(_timeSnapshotForSpecialMenu == 0) {
+      _timeSnapshotForSpecialMenu = myRTC.get();
+      _tempCurrentHour = hour(_timeSnapshotForSpecialMenu);
+      _tempCurrentMinute = minute(_timeSnapshotForSpecialMenu);
     }
+
+    if(smallButton.isClicked()) {
+      _changingSystemClockHours = !_changingSystemClockHours;
+    }
+
+    if(_changingSystemClockHours) {
+
+      lcd.print(F("["));
+      lcdPrintDigits(_tempCurrentHour);
+      lcd.print(F("]"));
+      lcdPrintDigits(_tempCurrentMinute);
+
+      // Handle hours
+      if (rotaryState == CLOCKWISE) {
+        if(_tempCurrentHour < 23) {
+          _tempCurrentHour++;
+        } else {
+          _tempCurrentHour = 0;
+        }
+      }
+      if (rotaryState == COUNTER_CLOCKWISE) {
+        if(_tempCurrentHour >= 1) {
+          _tempCurrentHour--;
+        } else {
+          _tempCurrentHour = 23;
+        }
+      }
+    } else {
+
+      lcd.print(F(""));
+      lcdPrintDigits(_tempCurrentHour);
+      lcd.print(F("["));
+      lcdPrintDigits(_tempCurrentMinute);
+      lcd.print(F("]"));
+
+      // Handle minutes
+      if (rotaryState == CLOCKWISE) {
+        if(_tempCurrentMinute < 59) {
+          _tempCurrentMinute++;
+        } else {
+          _tempCurrentMinute = 0;
+        }
+      }
+      if (rotaryState == COUNTER_CLOCKWISE) {
+        if(_tempCurrentMinute >= 1) {
+          _tempCurrentMinute--;
+        } else {
+          _tempCurrentMinute = 59;
+        }
+      }
+    }
+  }
+}
+
+void handleLcdBacklightStandbyMode() {
+  unsigned long currentMillis = millis();
+  if(currentMillis - _previousMillis > _timeoutBacklightMs) {
+    _previousMillis = currentMillis;
+
+    // Turn off lcd
+    Serial << F("Turning off backlight due to inactivity ...\n");
+    lcd.noBacklight();
   }
 }
 
@@ -318,8 +357,6 @@ void handleSoftReset() {
       if(currentResetState == LOW) {
         if(softResetButtonHold.expired()) {
           executeSoftReset();
-        } else {
-          Serial << "User pressed soft reset button but not long enough.\n";
         }
         softResetButtonHold.stop();
       } else {
@@ -330,9 +367,10 @@ void handleSoftReset() {
 }
 
 void executeSoftReset() {
-  Serial << "Executing soft reset ...\n";
+  Serial << F("Executing soft reset ...\n");
+  lcd.backlight();
   lcd.clear();
-  lcd.println("RESETTING ...    ");
+  lcd.println(F("RESETTING ...       "));
   resetProgram();
 }
 
@@ -349,28 +387,12 @@ void readRotaryEncoderStates() {
 
   //Returns true if turning Counter-Clockwise. COUNTER_CLOCKWISE = 1.
   if (rotaryState == COUNTER_CLOCKWISE) {
-    if(!_menuIsActive && !_specialMenuActivated) {
-      int a = _menuAction;
-      a--;
-      if(a <= 0) {
-        a = 0;
-      }
-      _menuAction = a;
-      Serial << "cntr: " << a << "\n";
-    }
+    lcd.backlight();
   }
 
   //Returns true if turning Clockwise. CLOCKWISE = 2.
   if (rotaryState == CLOCKWISE) {
-    if(!_menuIsActive && !_specialMenuActivated) {
-      int a = _menuAction;
-      a++;
-      if(a >= 2) {
-        a = 2;
-      }
-      _menuAction = a;
-      Serial << "clk: " << a << "\n";
-    }
+    lcd.backlight();
   }
 }
 
@@ -380,10 +402,13 @@ void handleButtonKeyPresses() {
     if (currentState != _buttonState) {
       _buttonState = currentState;
       if (_buttonState) {
-        if (buttonHold.expired())
+        if (buttonHold.expired()) {
+          Serial << F("Knob button held for a longer period.");
           doReturnButton();
-        else
+        }
+        else {
           doButton();
+        }
         buttonHold.stop();
       }
       else {
@@ -396,7 +421,7 @@ void handleButtonKeyPresses() {
 void handleAlarmOccurrence() {
   if ( !digitalRead(RTC_INT_PIN) && (_currentBinIndex < NUMBER_OF_BINS) ) {
     myRTC.alarm(DS3232RTC::ALARM_2);    // reset the alarm flag
-    Serial << "Alarm #2 has occurred!\n";
+    Serial << F("Alarm #2 has occurred!\n");
 
     if(_currentBinIndex < (sizeof(BINS) / sizeof(BIN_STATE))) {
       // Open first bin (from bottom to top)
@@ -410,15 +435,12 @@ void handleAlarmOccurrence() {
       }
 
       // Schedule alarm for next bin
-      Serial.println(F("Setting new alarm ..."));
-      Serial.print(F("Next bin (index) to open = "));
-      Serial.print(_currentBinIndex);
-      Serial.println();
-      Serial.println(F("New alarm setting: "));
+      Serial << F("Setting new alarm ...\n");
+      Serial << F("Next bin (index) to open = ") << _currentBinIndex << F("\n");
       int h = _alarmSchemes[_currentBinIndex]->hour;
       int m = _alarmSchemes[_currentBinIndex]->minute;
-      Serial << h << ":" << m << "\n";
-      Serial << "Setting alarm #2 bin (ID: " << _currentBinIndex << ") on " << h << "h : " << m << "m\n";
+      Serial << F("New alarm setting: ") << h << F(":") << m << F("\n");
+      Serial << F("Setting alarm #2 bin (ID: ") << _currentBinIndex << F(") on ") << h << F("h : ") << m << F("m\n");
       myRTC.setAlarm(DS3232RTC::ALM2_MATCH_HOURS, 0, m, h, 0);
     }
   }
@@ -426,13 +448,13 @@ void handleAlarmOccurrence() {
 
 void drawStatusScreen(time_t t) {
   lcd.setCursor(0, 0);
-  lcd.print(F("FSv0.1 "));
+  lcd.print(F("   "));
   lcdPrintDigits(hour(t));
   lcd.print(F(":"));
   lcdPrintDigits(minute(t));
   lcd.print(F(":"));
   lcdPrintDigits(second(t));
-  lcd.print(F(" "));
+  lcd.print(F("    "));
   float celsius = myRTC.temperature() / 4.0;
   lcd.print((int)celsius);
   lcd.print((char)223);
@@ -452,24 +474,13 @@ void drawStatusScreen(time_t t) {
   lcd.setCursor(0, 2);
   lcd.print(F("Voerbeurt > #"));
   lcd.print(_currentBinIndex+1);
-  lcd.print(" ");
+  lcd.print(F(" "));
   lcdPrintDigits(_alarmSchemes[_currentBinIndex]->hour);
   lcd.print(F(":"));
   lcdPrintDigits(_alarmSchemes[_currentBinIndex]->minute);
 
-  // Print special menu
-  lcd.setCursor(0, 4);
-  switch(_menuAction) {
-    case NOTHING:
-      lcd.print(F("             "));
-    break;
-    case SET_TIME:
-      lcd.print(F("SET TIME     "));
-    break;
-    case RESET_SCHEMA:
-      lcd.print(F("RESET SCHEMA "));
-    break;
-  }
+  lcd.setCursor(0, 3);
+  lcd.print(F("FeedStar 600 v0.1"));
 }
 
 bool isKnobRotatingClockwise() {
@@ -619,14 +630,6 @@ void handleAlarmAdjustment() {
   }
 }
 
-void printDateTime(time_t t) {
-    Serial << ((day(t)<10) ? "0" : "") << _DEC(day(t));
-    Serial << monthShortStr(month(t)) << _DEC(year(t)) << ' ';
-    Serial << ((hour(t)<10) ? "0" : "") << _DEC(hour(t)) << ':';
-    Serial << ((minute(t)<10) ? "0" : "") << _DEC(minute(t)) << ':';
-    Serial << ((second(t)<10) ? "0" : "") << _DEC(second(t));
-}
-
 void lcdPrintDigits(int digits) {
   // Pads digit with 0 when lower than 10
   if(digits < 10) {
@@ -636,21 +639,7 @@ void lcdPrintDigits(int digits) {
 }
 
 void doButton() {
-  if(!_menuIsActive) {
-    switch(_menuAction) {
-      case NOTHING:
-        _specialMenuActivated = false;
-        break;
-      case SET_TIME:
-        //_specialMenuActivated = !_specialMenuActivated;
-        //lcd.clear(); // Clear LCD for upcoming menu
-        break;
-      case RESET_SCHEMA:
-        //_specialMenuActivated = !_specialMenuActivated;
-        //lcd.clear(); // Clear LCD for upcoming menu
-        break;
-    }
-  }
+  Serial << F("doButton()\n");
 
   // Handle logic for second button press
   if(_allowChangingTheHours || _allowChangingTheMinutes) {
@@ -664,34 +653,31 @@ void doButton() {
 
   if(hoursAreHighlighted()) {
     // Allow the user to change the hours with the dial
-    Serial << "Hours are highlighted\n";
+    Serial << F("Hours are highlighted\n");
     _allowChangingTheHours = true;
     _allowChangingTheMinutes = false;
   }
 
   if(minutesAreHighlighted()) {
     // Allow the user to change the minutes with the dial
-    Serial << "Minutes are highlighted\n";
+    Serial << F("Minutes are highlighted\n");
     _allowChangingTheHours = false;
     _allowChangingTheMinutes = true;
   }
 
   if(!_allowChangingTheHours && !_allowChangingTheMinutes) {
-    // Store new alarm scheme in memory and EEPROM
-    //saveAlarmSchemes();
-    
     // After storing make sure the current alarms are reset
     resetAlarm(); 
   }
 }
 
 void resetAlarm() {
-  Serial << "Resetting alarms ...\n";
+  Serial << F("Resetting alarms ...\n");
   myRTC.clearAlarm(DS3232RTC::ALARM_2);
   // set Alarm 2
   int alarmHour = _alarmSchemes[_currentBinIndex]->hour;
   int alarmMinute = _alarmSchemes[_currentBinIndex]->minute;
-  Serial << "Setting alarm #2 for bin " << _currentBinIndex+1 << " (ID: " << _currentBinIndex << ") on " << alarmHour << "h : " << alarmMinute << "m\n";
+  Serial << F("Setting alarm #2 for bin ") << _currentBinIndex+1 << F(" (ID: ") << _currentBinIndex << F(") on ") << alarmHour << F("h : ") << alarmMinute << F("m\n");
   myRTC.setAlarm(DS3232RTC::ALM2_MATCH_HOURS, 0, alarmMinute, alarmHour, 0);
 }
 
@@ -722,33 +708,12 @@ void doReturnButton() {
 void openBin(unsigned int binNumber) {
   int currentPinForRelayInput = _relayPins[binNumber];
   BINS[binNumber] = OPEN;
-  Serial << "Opening bin[" << binNumber << "] (#" << binNumber+1 << ") on relay IO pin: " << currentPinForRelayInput << " with demagnetize delay of: " << DEMAGNETIZE_DELAY_MS << " ms ...";
+  Serial << F("Opening bin[") << binNumber << F("] (#") << binNumber+1 << F(") on relay IO pin: ") << currentPinForRelayInput << F(" with demagnetize delay of: ") << DEMAGNETIZE_DELAY_MS << F(" ms ...\n");
   toggleMagnet(currentPinForRelayInput);
 }
 
 void toggleMagnet(int pin) {
-  digitalWrite(pin, LOW); // Why send LOW?
+  digitalWrite(pin, LOW);
   delay(DEMAGNETIZE_DELAY_MS);
-  digitalWrite(pin, HIGH); // Reset back to normal
-}
-
-void runTestMode() {
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(F("TEST MODE"));
-
-  for(int i=0; i<NUMBER_OF_BINS; i++) {
-    lcd.setCursor(0, 1);
-    lcd.print(F("TEST RELAY PIN: "));
-    lcd.print(_relayPins[i]);
-    lcd.setCursor(0, 2);
-    lcd.print(F("Magnet #"));
-    lcd.print(i+1);
-    lcd.print(F(" ["));
-    lcd.print(i);
-    lcd.print(F("]"));
-    toggleMagnet(_relayPins[i]);
-    delay(2500);
-  }
-  delay(5000);
+  digitalWrite(pin, HIGH);
 }
