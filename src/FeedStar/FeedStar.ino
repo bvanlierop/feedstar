@@ -64,12 +64,12 @@ BIN_STATE BINS[NUMBER_OF_BINS] = {SHUT, SHUT, SHUT, SHUT, SHUT, SHUT, SHUT};
 
 // Default time: 20:00, 23:00, 02:00, 05:00, 8:00, 11:00, 14:00
 AlarmScheme _as1 = { 1, 20, 0, false, false }; // Most bottom drawer
-AlarmScheme _as2 = { 2, 20, 1, false, false };
-AlarmScheme _as3 = { 3, 20, 2, false, false };
-AlarmScheme _as4 = { 4, 20, 3, false, false };
-AlarmScheme _as5 = { 5, 20, 4, false, false };
-AlarmScheme _as6 = { 6, 20, 5, false, false };
-AlarmScheme _as7 = { 7, 20, 6, false, false };
+AlarmScheme _as2 = { 2, 23, 0, false, false };
+AlarmScheme _as3 = { 3, 2, 0, false, false };
+AlarmScheme _as4 = { 4, 5, 0, false, false };
+AlarmScheme _as5 = { 5, 8, 0, false, false };
+AlarmScheme _as6 = { 6, 11, 0, false, false };
+AlarmScheme _as7 = { 7, 14, 0, false, false };
 
 AlarmScheme *_alarmSchemes[NUMBER_OF_BINS] = { &_as1, &_as2, &_as3, &_as4, &_as5, &_as6, &_as7 };
 bool _allowChangingTheHours = false;   // Controls the changing of hours
@@ -93,7 +93,7 @@ void rotaryServiceRoutineWrapper() {
 
 void setup() {
   Serial.begin(9600);
-  Serial << F("Starting FeedStar 600 program ...\n");
+  Serial << F("Starting FeedStar program ...\n");
 
   // initialize the alarms to known values, clear the alarm flags, clear the alarm interrupt flags
   pinMode(RTC_INT_PIN, INPUT_PULLUP); // Set interrupt pin for RTC module (alarm signal)
@@ -140,9 +140,6 @@ void setup() {
   // Init double clickable button (soft reset button)
   smallButton.begin();
 
-  // Configure the schema
-  configureInitialSchema();
-
   // Setup Alarming
   configureAlarm();
 }
@@ -187,9 +184,6 @@ void resetProgram() {
   myRTC.alarmInterrupt(DS3232RTC::ALARM_2, false);
   myRTC.squareWave(DS3232RTC::SQWAVE_NONE);
 
-  // Configure the schema
-  configureInitialSchema();
-
   // Setup Alarming
   configureAlarm();
 }
@@ -205,25 +199,6 @@ void configureAlarm() {
   myRTC.squareWave(DS3232RTC::SQWAVE_NONE);
   // enable interrupt output for Alarm 2 only
   myRTC.alarmInterrupt(DS3232RTC::ALARM_2, true);
-}
-
-void configureInitialSchema() {
-  // For testing, initiate alarms with quick testable schedule
-  time_t t = myRTC.get();
-  int currentHour = hour(t);
-  int currentMinute = minute(t);
-  AlarmScheme as1 = { 1, currentHour, currentMinute+1, false, false }; // Most bottom drawer
-  AlarmScheme as2 = { 2, currentHour, currentMinute+2, false, false };
-  AlarmScheme as3 = { 3, currentHour, currentMinute+3, false, false };
-  AlarmScheme as4 = { 4, currentHour, currentMinute+4, false, false };
-  AlarmScheme as5 = { 5, currentHour, currentMinute+5, false, false };
-  AlarmScheme as6 = { 6, currentHour, currentMinute+6, false, false };
-  AlarmScheme as7 = { 7, currentHour, currentMinute+7, false, false };
-
-  for(int i=0; i<NUMBER_OF_BINS; i++) {
-    _alarmSchemes[i]->hour = currentHour;
-    _alarmSchemes[i]->minute = currentMinute + i + 1;
-  }
 }
 
 void loop() {
@@ -480,7 +455,7 @@ void drawStatusScreen(time_t t) {
   lcdPrintDigits(_alarmSchemes[_currentBinIndex]->minute);
 
   lcd.setCursor(0, 3);
-  lcd.print(F("FeedStar 600 v0.1"));
+  lcd.print(F("FeedStar v0.2"));
 }
 
 bool isKnobRotatingClockwise() {
